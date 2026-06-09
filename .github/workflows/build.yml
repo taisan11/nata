@@ -51,11 +51,21 @@ jobs:
           name: app-${{ matrix.artifact }}
           path: |
             target/${{ matrix.target }}/release/*
-      - name: Create GitHub Release
-        uses: svenstaro/upload-release-action@v2
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
-          assets: |
-            target/${{ matrix.target }}/release/*
-          tag: v${{ github.event.inputs.version }}
+          path: release-files
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.event.inputs.version }}
+          files: release-files/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
