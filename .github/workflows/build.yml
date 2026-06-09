@@ -1,0 +1,61 @@
+name: Rust Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build'
+        required: true
+        default: '0.1.0'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: linux
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: windows
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: macos-arm
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cargo registry + target を自動キャッシュ
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ matrix.artifact }}
+          path: |
+            target/${{ matrix.target }}/release/*
+      - name: Create GitHub Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          assets: |
+            target/${{ matrix.target }}/release/*
+          tag: v${{ github.event.inputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
