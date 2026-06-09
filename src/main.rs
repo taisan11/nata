@@ -3,7 +3,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{read, Event, KeyCode, KeyEventKind},
     execute, queue,
-    style::{Attribute, SetAttribute},
+    style::{Attribute, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
         disable_raw_mode,
         enable_raw_mode,
@@ -15,15 +15,11 @@ use crossterm::{
     },
 };
 use std::io::{stdout, Write};
-use tree_sitter::{Language, Node, Parser};
-use tree_sitter_rust;
-
-const C_KW: &str = "\x1b[38;5;33m";
-const C_STR: &str = "\x1b[38;5;28m";
-const C_CMT: &str = "\x1b[38;5;245m";
-const C_NUM: &str = "\x1b[38;5;198m";
-const C_TYP: &str = "\x1b[38;5;44m";
-const C_RS: &str = "\x1b[0m";
+mod tree_sitter;
+use tree_sitter::TreeSitter;
+// use env_logger;
+// use log::{error, warn, info, debug};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 struct Editor {
     cursor_x: usize,
@@ -38,16 +34,16 @@ struct Editor {
 
     filepath: Option<String>,
 
-    lang: Option<Language>,
-    parser: Option<Parser>,
-    highlights: Vec<(usize, usize, usize, u32, &'static str)>,
+    dirty: bool,
+
+    treesitter: TreeSitter,
 }
 
 impl Editor {
     fn new() -> Self {
         Self {
             cursor_x: 0,
-            cursor_y: 1,
+            cursor_y: 0,
             row_offset: 0,
             col_offset: 0,
             rows: vec![
@@ -56,10 +52,9 @@ impl Editor {
             ],
             should_quit: false,
             filepath: None,
+            dirty: false,
 
-            lang: None,
-            parser: None,
-            highlights: Vec::new(),
+            treesitter: TreeSitter::new(None),
         }
     }
 
@@ -71,14 +66,17 @@ impl Editor {
             if let Ok(contents) = std::fs::read_to_string(path) {
                 self.rows = contents.lines().map(|l| l.to_string()).collect();
             }
+            self.dirty = false;
         }
 
-        self.init_treesitter();
+        self.treesitter = TreeSitter::new(self.filepath.as_deref());
+        self.treesitter.reparse(&self.rows);
 
         while !self.should_quit {
             self.draw()?;
             self.process_keypress()?;
         }
+        // debug!("Exiting editor");
 
         Ok(())
     }
@@ -105,9 +103,10 @@ impl Editor {
             out,
             "{:width$}",
             format!(
-                "Nano-rs - {} lines - Open: {}",
-                self.rows.len()-1,
-                self.filepath.as_deref().unwrap_or("newfile")
+                "nata - {} lines - Open: {}{}",
+                self.rows.len(),
+                self.filepath.as_deref().unwrap_or("newfile"),
+                if self.dirty { " (*)" } else { "" }
             ),
             width = width as usize,
         )?;
@@ -120,8 +119,12 @@ impl Editor {
 
             let row_index = self.row_offset + y as usize;
             if let Some(row) = self.rows.get(row_index) {
-                let start = self.col_offset.min(row.len());
-                let end = (self.col_offset + width as usize).min(row.len());
+                let start = col_to_byte(row, self.col_offset);
+                let end_vis = self.col_offset.saturating_add(width as usize);
+                let mut end = col_to_byte(row, end_vis);
+                if end == start && start < row.len() {
+                    end = start + row[start..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                }
                 let colored = self.color_slice(row, row_index, start, end);
                 write!(out, "{colored}")?;
             }
@@ -135,8 +138,8 @@ impl Editor {
             "{:width$}",
             format!(
                 "[Ctrl+Q quit] Ln {}, Col {}",
-                self.cursor_y,
-                self.cursor_x + 1
+                self.cursor_y + 1,
+                self.cursor_col() + 1
             ),
             width = width as usize,
         )?;
@@ -145,8 +148,8 @@ impl Editor {
         queue!(
             out,
             MoveTo(
-                (self.cursor_x - self.col_offset) as u16,
-                (self.cursor_y - self.row_offset) as u16
+                (self.cursor_col() - self.col_offset) as u16,
+                (self.cursor_y - self.row_offset + 1) as u16
             ),
             Show
         )?;
@@ -167,11 +170,12 @@ impl Editor {
             self.row_offset = self.cursor_y - text_height as usize + 1;
         }
 
-        // horizontal
-        if self.cursor_x < self.col_offset {
-            self.col_offset = self.cursor_x;
-        } else if self.cursor_x >= self.col_offset + width as usize {
-            self.col_offset = self.cursor_x - width as usize + 1;
+        // horizontal (visual columns)
+        let cur_col = self.cursor_col();
+        if cur_col < self.col_offset {
+            self.col_offset = cur_col;
+        } else if cur_col >= self.col_offset.saturating_add(width as usize) {
+            self.col_offset = cur_col - width as usize + 1;
         }
 
         Ok(())
@@ -179,7 +183,11 @@ impl Editor {
 
     fn process_keypress(&mut self) -> Result<()> {
         loop {
-            if let Event::Key(key) = read()? {
+            let event = match read() {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if let Event::Key(key) = event {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -192,6 +200,19 @@ impl Editor {
                     {
                         self.should_quit = true;
                     }
+
+                    KeyCode::Char('s')
+                        if key.modifiers.contains(
+                            crossterm::event::KeyModifiers::CONTROL
+                        ) =>
+                    {
+                        self.dirty = false;
+                        if let Some(path) = &self.filepath {
+                            std::fs::write(path, self.rows.join("\n"))?;
+                            self.treesitter.reparse(&self.rows);
+                        }
+                    }
+
 
                     KeyCode::Up => {
                         if self.cursor_y > 0 {
@@ -219,19 +240,22 @@ impl Editor {
                             self.cursor_x = self.rows
                                 [self.cursor_y]
                                 .len();
-                        } else {
-                            self.cursor_x = self
-                                .cursor_x
-                                .saturating_sub(1);
+                        } else if self.cursor_x > 0 {
+                            let row = &self.rows[self.cursor_y];
+                            self.cursor_x = row[..self.cursor_x]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap();
                         }
                     }
 
                     KeyCode::Right => {
-                        let row_len = self
-                            .rows
+                        let row = self.rows
                             .get(self.cursor_y)
-                            .map(|r| r.len())
-                            .unwrap_or(0);
+                            .map(|r| r.as_str())
+                            .unwrap_or("");
+                        let row_len = row.len();
 
                         if self.cursor_x >= row_len
                             && self.cursor_y + 1
@@ -239,31 +263,47 @@ impl Editor {
                         {
                             self.cursor_y += 1;
                             self.cursor_x = 0;
-                        } else {
-                            self.cursor_x = (self
-                                .cursor_x + 1)
-                                .min(row_len);
+                        } else if self.cursor_x < row_len {
+                            self.cursor_x += row[self.cursor_x..]
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(1);
                         }
                     }
 
                     KeyCode::Enter => {
+                        let rest = self.rows[self.cursor_y]
+                            .split_off(self.cursor_x);
                         self.rows.insert(
                             self.cursor_y + 1,
-                            String::new(),
+                            rest,
                         );
 
                         self.cursor_y += 1;
                         self.cursor_x = 0;
+                        self.dirty = true;
                     }
 
                     KeyCode::Backspace => {
                         if self.cursor_x > 0 {
                             let row =
                                 &mut self.rows[self.cursor_y];
+                            let prev = row[..self.cursor_x]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap();
+                            row.remove(prev);
 
-                            row.remove(self.cursor_x - 1);
-
-                            self.cursor_x -= 1;
+                            self.cursor_x = prev;
+                            self.dirty = true;
+                        } else if self.cursor_y > 0 {
+                            let current = self.rows.remove(self.cursor_y);
+                            self.cursor_y -= 1;
+                            self.cursor_x = self.rows[self.cursor_y].len();
+                            self.rows[self.cursor_y].push_str(&current);
+                            self.dirty = true;
                         }
                     }
 
@@ -273,13 +313,14 @@ impl Editor {
 
                         row.insert(self.cursor_x, c);
 
-                        self.cursor_x += 1;
+                        self.cursor_x += c.len_utf8();
+                        self.dirty = true;
                     }
 
                     _ => {}
                 }
 
-                self.reparse();
+                self.treesitter.reparse(&self.rows);
                 self.scroll()?;
                 break;
             }
@@ -299,133 +340,69 @@ impl Editor {
         }
     }
 
-    fn init_treesitter(&mut self) {
-        let lang = self.detect_language();
-        if let Some(lang) = lang {
-            let mut parser = Parser::new();
-            if parser.set_language(&lang).is_ok() {
-                self.lang = Some(lang);
-                self.parser = Some(parser);
-                self.reparse();
-            }
-        }
-    }
+    fn color_slice(
+        &self,
+        line: &str,
+        row_index: usize,
+        start: usize,
+        end: usize,
+    ) -> String {
+        let mut colored = String::new();
+        let mut idx = start;
 
-    fn detect_language(&self) -> Option<Language> {
-        let path = self.filepath.as_deref()?;
-        if path.ends_with(".rs") {
-            Some(tree_sitter_rust::LANGUAGE.into())
-        } else {
-            None
-        }
-    }
-
-    fn reparse(&mut self) {
-        let parser = match self.parser.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
-        let source = self.rows.join("\n");
-        if let Some(tree) = parser.parse(&source, None) {
-            self.highlights.clear();
-            self.collect_spans(tree.root_node(), 0);
-            self.highlights.sort_by(|a, b| b.3.cmp(&a.3));
-        }
-    }
-
-    fn collect_spans(&mut self, node: Node, depth: u32) {
-        let kind = node.kind();
-        let is_named = node.is_named();
-        let start = node.start_position();
-        let end = node.end_position();
-
-        if let Some(color) = color_for_kind(kind, is_named) {
-            if start.row == end.row {
-                self.highlights.push((start.row, start.column, end.column, depth, color));
-            } else {
-                let line_len = self.rows[start.row].len();
-                self.highlights.push((start.row, start.column, line_len, depth, color));
-                for r in (start.row + 1)..end.row {
-                    let len = self.rows[r].len();
-                    self.highlights.push((r, 0, len, depth, color));
-                }
-                self.highlights.push((end.row, 0, end.column, depth, color));
-            }
-        }
-
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
-                self.collect_spans(child, depth + 1);
-            }
-        }
-    }
-
-    fn color_slice(&self, row: &str, row_index: usize, start: usize, end: usize) -> String {
-        let len = end - start;
-        if self.highlights.is_empty() || len == 0 {
-            return row[start..end].to_string();
-        }
-
-        let mut line_colors: Vec<Option<&str>> = vec![None; len];
-
-        for &(hr, hs, he, _depth, color) in &self.highlights {
-            if hr != row_index || he <= start || hs >= end {
+        for &(r, s, e, _, color) in &self.treesitter.highlights {
+            if r != row_index || e <= start || s >= end {
                 continue;
             }
-            let lo = if hs > start { hs - start } else { 0 };
-            let hi = if he < end { he - start } else { len };
-            for i in lo..hi {
-                if line_colors[i].is_none() {
-                    line_colors[i] = Some(color);
+
+            if s >= idx {
+                if idx < s && idx < end {
+                    colored.push_str(&line[idx..s.min(end)]);
                 }
+
+                if s < end {
+                    colored.push_str(&format!("{}", SetForegroundColor(color)));
+                    colored.push_str(&line[s..e.min(end)]);
+                    colored.push_str(&format!("{}", ResetColor));
+                }
+
+                idx = e.max(idx);
+            }
+
+            if idx >= end {
+                break;
             }
         }
 
-        let mut result = String::new();
-        let mut i = 0;
-        while i < len {
-            if let Some(c) = line_colors[i] {
-                result.push_str(c);
-                let chunk_start = i;
-                while i < len && line_colors[i] == Some(c) {
-                    i += 1;
-                }
-                result.push_str(&row[start + chunk_start..start + i]);
-                result.push_str(C_RS);
-            } else {
-                let chunk_start = i;
-                while i < len && line_colors[i].is_none() {
-                    i += 1;
-                }
-                result.push_str(&row[start + chunk_start..start + i]);
-            }
+        if idx < end {
+            colored.push_str(&line[idx..end]);
         }
 
-        result
+        colored
+    }
+
+    fn cursor_col(&self) -> usize {
+        self.rows
+            .get(self.cursor_y)
+            .map(|row| byte_to_col(row, self.cursor_x))
+            .unwrap_or(0)
     }
 }
 
-fn color_for_kind(kind: &str, is_named: bool) -> Option<&'static str> {
-    if !is_named {
-        match kind {
-            "let"|"mut"|"fn"|"if"|"else"|"for"|"while"|"loop"|"match"|"return"
-            |"struct"|"enum"|"impl"|"trait"|"pub"|"use"|"mod"|"in"|"ref"
-            |"break"|"continue"|"as"|"where"|"type"|"const"|"static"|"unsafe"
-            |"async"|"await"|"move"|"dyn"|"true"|"false"|"super"|"self"|"crate"
-            |"extern"|"union"|"default"|"macro_rules" => Some(C_KW),
-            _ => None,
+fn byte_to_col(row: &str, byte: usize) -> usize {
+    row[..byte].width()
+}
+
+fn col_to_byte(row: &str, col: usize) -> usize {
+    let mut vis = 0;
+    for (i, c) in row.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if vis + w > col {
+            return i;
         }
-    } else {
-        match kind {
-            "string_literal"|"raw_string_literal" => Some(C_STR),
-            "line_comment"|"block_comment" => Some(C_CMT),
-            "integer_literal"|"float_literal" => Some(C_NUM),
-            "escape_sequence"|"char_literal" => Some(C_STR),
-            "type_identifier"|"primitive_type" => Some(C_TYP),
-            "self"|"super"|"crate" => Some(C_KW),
-            _ => None,
-        }
+        vis += w;
     }
+    row.len()
 }
 
 struct TerminalGuard;
@@ -457,6 +434,18 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> noargs::Result<()> {
+    // let file = std::fs::OpenOptions::new()
+    //     .create(true)
+    //     .append(true)
+    //     .open("app.log")
+    //     .unwrap();
+
+    // // env_logger のBuilderを初期化し、ターゲットをファイルに変更
+    // env_logger::Builder::new()
+    //     .target(env_logger::Target::Pipe(Box::new(file)))
+    //     .filter_level(log::LevelFilter::Debug) // デフォルトでDebug以上を出力
+    //     .parse_default_env() // RUST_LOG で上書き可能
+    //     .init();
     let mut args = noargs::raw_args();
     args.metadata_mut().app_name = env!("CARGO_PKG_NAME");
     args.metadata_mut().app_description = env!("CARGO_PKG_DESCRIPTION");
@@ -478,7 +467,9 @@ fn main() -> noargs::Result<()> {
     }
 
     let mut editor = Editor::new();
-    editor.run(filepath)?;
+    editor.run(filepath).unwrap_or_else(|e| {
+        println!("Error: {e}");
+    });
 
     Ok(())
 }
