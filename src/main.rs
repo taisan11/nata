@@ -17,6 +17,8 @@ use crossterm::{
 use std::io::{stdout, Write};
 mod tree_sitter;
 use tree_sitter::TreeSitter;
+mod config;
+use config::{load_config,Config};
 // use env_logger;
 // use log::{error, warn, info, debug};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -36,11 +38,11 @@ struct Editor {
 
     dirty: bool,
 
-    treesitter: TreeSitter,
+    treesitter: Option<TreeSitter>,
 }
 
 impl Editor {
-    fn new() -> Self {
+    fn new(treesitter_enabled: bool) -> Self {
         Self {
             cursor_x: 0,
             cursor_y: 0,
@@ -54,7 +56,7 @@ impl Editor {
             filepath: None,
             dirty: false,
 
-            treesitter: TreeSitter::new(None),
+            treesitter: treesitter_enabled.then(|| TreeSitter::new(None)),
         }
     }
 
@@ -69,8 +71,10 @@ impl Editor {
             self.dirty = false;
         }
 
-        self.treesitter = TreeSitter::new(self.filepath.as_deref());
-        self.treesitter.reparse(&self.rows);
+        if let Some(ts) = &mut self.treesitter {
+            *ts = TreeSitter::new(self.filepath.as_deref());
+            ts.reparse(&self.rows);
+        }
 
         while !self.should_quit {
             self.draw()?;
@@ -209,7 +213,9 @@ impl Editor {
                         self.dirty = false;
                         if let Some(path) = &self.filepath {
                             std::fs::write(path, self.rows.join("\n"))?;
-                            self.treesitter.reparse(&self.rows);
+                            if let Some(ts) = &mut self.treesitter {
+                                ts.reparse(&self.rows);
+                            }
                         }
                     }
 
@@ -320,7 +326,9 @@ impl Editor {
                     _ => {}
                 }
 
-                self.treesitter.reparse(&self.rows);
+                if let Some(ts) = &mut self.treesitter {
+                    ts.reparse(&self.rows);
+                }
                 self.scroll()?;
                 break;
             }
@@ -347,10 +355,15 @@ impl Editor {
         start: usize,
         end: usize,
     ) -> String {
+        let ts = match &self.treesitter {
+            Some(ts) => ts,
+            None => return line[start..end].to_string(),
+        };
+
         let mut colored = String::new();
         let mut idx = start;
 
-        for &(r, s, e, _, color) in &self.treesitter.highlights {
+        for &(r, s, e, _, color) in &ts.highlights {
             if r != row_index || e <= start || s >= end {
                 continue;
             }
@@ -456,6 +469,10 @@ fn main() -> noargs::Result<()> {
     }
     noargs::HELP_FLAG.take_help(&mut args);
 
+    let configpath: Option<String> = noargs::opt("config")
+        .short('c')
+        .take(&mut args).present_and_then(|o| o.value().parse())?;
+
     let filepath: Option<String> = noargs::arg("[filepath]")
         .take(&mut args).present_and_then(|a| a.value().parse())?;
 
@@ -466,7 +483,12 @@ fn main() -> noargs::Result<()> {
         return Ok(());
     }
 
-    let mut editor = Editor::new();
+    let config = load_config(configpath).unwrap_or_else(|e| {
+        eprintln!("Warning: failed to load config: {e}, using defaults");
+        Config { treesitter: true }
+    });
+
+    let mut editor = Editor::new(config.treesitter);
     editor.run(filepath).unwrap_or_else(|e| {
         println!("Error: {e}");
     });
