@@ -48,12 +48,16 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Rename binary
+        run: mv "target/${{ matrix.target }}/release/${{ matrix.binary }}" "target/${{ matrix.target }}/release/nata-${{ matrix.artifact }}${{ runner.os == 'Windows' && '.exe' || '' }}"
+        shell: bash
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-${{ matrix.artifact }}
           path: |
-            target/${{ matrix.target }}/release/${{ matrix.binary }}
+            target/${{ matrix.target }}/release/nata-${{ matrix.artifact }}${{ runner.os == 'Windows' && '.exe' || '' }}
 
   release:
     needs: build
