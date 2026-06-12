@@ -1,7 +1,5 @@
 use crossterm::style::Color;
 use tree_sitter::{Language, Node, Parser};
-use tree_sitter_javascript;
-use tree_sitter_rust;
 
 pub struct TreeSitter {
     parser: Option<Parser>,
